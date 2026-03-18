@@ -1,10 +1,12 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
-import { io, Socket } from 'socket.io-client';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import axios from 'axios';
 import { useAuthStore } from '../../store/auth';
 import { useNavigate } from 'react-router-dom';
+import { API_URL, SOCKET_URL } from '../../lib/env';
+import { useChatSocketConnection } from './hooks/useChatSocketConnection';
+import { useChatSocketEvents } from './hooks/useChatSocketEvents';
 
 interface Room {
   id: number;
@@ -47,8 +49,8 @@ interface RoomWithCount extends Room {
   onlineCount: number;
 }
 
-const baseURL = 'http://localhost:3000';
-const socketURL = 'http://localhost:3001';
+const baseURL = API_URL;
+const socketURL = SOCKET_URL;
 
 const ChatPage: React.FC = () => {
   const navigate = useNavigate();
@@ -57,12 +59,13 @@ const ChatPage: React.FC = () => {
   const clearAuth = useAuthStore((s) => s.clearAuth);
   const setAuth = useAuthStore((s) => s.setAuth);
   const queryClient = useQueryClient();
+  const roomCountsRef = useRef<Record<number, number>>({});
+  const unauthorizedHandledRef = useRef(false);
 
   const [currentRoomId, setCurrentRoomId] = useState<number | null>(null);
   const currentRoomIdRef = useRef<number | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState('');
-  const [socketConnected, setSocketConnected] = useState(false);
   const [pendingMessages, setPendingMessages] = useState<
     { clientMessageId: string; content: string; status: PendingStatus; reason?: string }[]
   >([]);
@@ -72,7 +75,6 @@ const ChatPage: React.FC = () => {
   const sendQueue = useRef<SendQueueItem[]>([]);
   const sendingRef = useRef(false);
 
-  const [socket, setSocket] = useState<Socket | null>(null);
   const [newRoomName, setNewRoomName] = useState('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [attachedImage, setAttachedImage] = useState<{
@@ -100,13 +102,51 @@ const ChatPage: React.FC = () => {
     input: string;
   }>({ open: false, roomId: null, roomName: '', input: '' });
 
+  const showNotice = useCallback((message: string, timeoutMs = 3000) => {
+    setSpamNotice(message);
+    window.setTimeout(() => setSpamNotice(null), timeoutMs);
+  }, []);
+
+  const forceLogout = useCallback(
+    (message?: string) => {
+      if (unauthorizedHandledRef.current) return;
+      unauthorizedHandledRef.current = true;
+      const finalMessage =
+        message || 'Sua sessão foi encerrada. Faça login novamente.';
+      sessionStorage.setItem('auth_notice', finalMessage);
+      clearAuth();
+      navigate('/auth', { replace: true });
+    },
+    [clearAuth, navigate],
+  );
+
+  useEffect(() => {
+    const interceptorId = axios.interceptors.response.use(
+      (response) => response,
+      (error) => {
+        if (error?.response?.status === 401) {
+          forceLogout('Sua sessão expirou ou foi encerrada. Faça login novamente.');
+        }
+        return Promise.reject(error);
+      },
+    );
+
+    return () => {
+      axios.interceptors.response.eject(interceptorId);
+    };
+  }, [forceLogout]);
+
   const { data: rooms, isLoading: loadingRooms } = useQuery<RoomWithCount[]>({
     queryKey: ['rooms'],
+    retry: false,
     queryFn: async () => {
       const res = await axios.get<Room[]>(`${baseURL}/rooms`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      return res.data.map((r) => ({ ...r, onlineCount: 0 }));
+      return res.data.map((r) => ({
+        ...r,
+        onlineCount: roomCountsRef.current[r.id] ?? 0,
+      }));
     },
   });
 
@@ -122,8 +162,7 @@ const ChatPage: React.FC = () => {
   const handleConfirmDeleteRoom = async () => {
     if (!confirmDeleteRoom.roomId) return;
     if (confirmDeleteRoom.input !== confirmDeleteRoom.roomName) {
-      setSpamNotice('Digite exatamente o nome da sala para apagar.');
-      window.setTimeout(() => setSpamNotice(null), 2500);
+      showNotice('Digite exatamente o nome da sala para apagar.', 2500);
       return;
     }
     try {
@@ -137,129 +176,110 @@ const ChatPage: React.FC = () => {
       await queryClient.invalidateQueries({ queryKey: ['rooms'] });
       setConfirmDeleteRoom({ open: false, roomId: null, roomName: '', input: '' });
     } catch (err: any) {
-      setSpamNotice(err.response?.data?.message || 'Erro ao apagar sala');
-      window.setTimeout(() => setSpamNotice(null), 3000);
+      showNotice(err.response?.data?.message || 'Erro ao apagar sala');
     }
   };
 
-  useEffect(() => {
-    const s = io(socketURL, {
-      auth: { token },
-      transports: ['websocket'],
-      reconnectionAttempts: 5,
-    });
-
-    s.on('connect', () => {
-      setSocketConnected(true);
-      window.setTimeout(() => drainQueue(), 0);
-    });
-    s.on('disconnect', () => setSocketConnected(false));
-
-    s.on('roomHistory', (payload: { roomId: number; messages: Message[] }) => {
-      if (payload.roomId === currentRoomIdRef.current) {
-        setMessages(payload.messages);
-        // ao entrar na sala, desce pro fim
-        requestAnimationFrame(() => {
-          if (payload.messages.length > 0) {
-            virtuosoRef.current?.scrollToIndex({
-              index: payload.messages.length - 1,
-              align: 'end',
-              behavior: 'auto',
-            });
-          }
-        });
-      }
-    });
-
-    s.on(
-      'newMessage',
-      (payload: { roomId: number; message: Message; clientMessageId?: string },
-    ) => {
-      if (payload.roomId === currentRoomIdRef.current) {
-        setMessages((prev) => {
-          const byId = prev.findIndex((m) => m.id === payload.message.id);
-          if (byId >= 0) {
-            const copy = prev.slice();
-            copy[byId] = payload.message;
-            return copy;
-          }
-
-          if (!payload.clientMessageId) return [...prev, payload.message];
-
-          const idx = prev.findIndex(
-            (m) => m.localClientMessageId === payload.clientMessageId,
-          );
-
-          // Se for confirmação da nossa mensagem otimista: substitui.
-          if (idx >= 0) {
-            const copy = prev.slice();
-            copy[idx] = payload.message;
-            return copy;
-          }
-
-          // Se não achou (ex: outra aba), apenas adiciona.
-          return [...prev, payload.message];
-        });
-
-        // ao receber mensagem, se estiver no fim, segue automaticamente
-        if (isAtBottom) {
-          requestAnimationFrame(() => {
-            virtuosoRef.current?.scrollToIndex({
-              index: 'LAST',
-              align: 'end',
-              behavior: 'smooth',
-            });
+  const onRoomHistory = useCallback((payload: { roomId: number; messages: Message[] }) => {
+    if (payload.roomId === currentRoomIdRef.current) {
+      setMessages(payload.messages);
+      requestAnimationFrame(() => {
+        if (payload.messages.length > 0) {
+          virtuosoRef.current?.scrollToIndex({
+            index: payload.messages.length - 1,
+            align: 'end',
+            behavior: 'auto',
           });
         }
+      });
+    }
+  }, []);
 
-        if (payload.clientMessageId) {
-          setPendingMessages((prev) =>
-            prev.filter((p) => p.clientMessageId !== payload.clientMessageId),
-          );
-          const t = pendingTimers.current[payload.clientMessageId];
-          if (t) {
-            window.clearTimeout(t);
-            delete pendingTimers.current[payload.clientMessageId];
-          }
+  const onNewMessage = useCallback(
+    (payload: { roomId: number; message: Message; clientMessageId?: string }) => {
+      if (payload.roomId !== currentRoomIdRef.current) return;
+
+      setMessages((prev) => {
+        const byId = prev.findIndex((m) => m.id === payload.message.id);
+        if (byId >= 0) {
+          const copy = prev.slice();
+          copy[byId] = payload.message;
+          return copy;
         }
-      }
-    });
 
-    s.on(
-      'sendError',
-      (payload: { clientMessageId?: string; message: string; retryAfterMs?: number }) => {
-        if (!payload.clientMessageId) return;
+        if (!payload.clientMessageId) return [...prev, payload.message];
+
+        const idx = prev.findIndex(
+          (m) => m.localClientMessageId === payload.clientMessageId,
+        );
+        if (idx >= 0) {
+          const copy = prev.slice();
+          copy[idx] = payload.message;
+          return copy;
+        }
+        return [...prev, payload.message];
+      });
+
+      if (isAtBottom) {
+        requestAnimationFrame(() => {
+          virtuosoRef.current?.scrollToIndex({
+            index: 'LAST',
+            align: 'end',
+            behavior: 'smooth',
+          });
+        });
+      }
+
+      if (payload.clientMessageId) {
         setPendingMessages((prev) =>
-          prev.map((p) =>
-            p.clientMessageId === payload.clientMessageId
-              ? { ...p, status: 'failed', reason: payload.message }
-              : p,
-          ),
+          prev.filter((p) => p.clientMessageId !== payload.clientMessageId),
         );
         const t = pendingTimers.current[payload.clientMessageId];
         if (t) {
           window.clearTimeout(t);
           delete pendingTimers.current[payload.clientMessageId];
         }
-        if (payload.message) {
-          setSpamNotice(payload.message);
-          window.setTimeout(() => setSpamNotice(null), 3000);
-        }
-      },
-    );
+      }
+    },
+    [isAtBottom],
+  );
 
-    s.on('messageUpdated', (payload: { roomId: number; message: Message }) => {
-      if (payload.roomId !== currentRoomIdRef.current) return;
-      setMessages((prev) => {
-        const idx = prev.findIndex((m) => m.id === payload.message.id);
-        if (idx < 0) return prev;
-        const copy = prev.slice();
-        copy[idx] = payload.message;
-        return copy;
-      });
+  const onSendError = useCallback(
+    (payload: { clientMessageId?: string; message: string; retryAfterMs?: number }) => {
+      if (!payload.clientMessageId) return;
+      setPendingMessages((prev) =>
+        prev.map((p) =>
+          p.clientMessageId === payload.clientMessageId
+            ? { ...p, status: 'failed', reason: payload.message }
+            : p,
+        ),
+      );
+      const t = pendingTimers.current[payload.clientMessageId];
+      if (t) {
+        window.clearTimeout(t);
+        delete pendingTimers.current[payload.clientMessageId];
+      }
+      if (payload.message) {
+        showNotice(payload.message);
+      }
+    },
+    [showNotice],
+  );
+
+  const onMessageUpdated = useCallback((payload: { roomId: number; message: Message }) => {
+    if (payload.roomId !== currentRoomIdRef.current) return;
+    setMessages((prev) => {
+      const idx = prev.findIndex((m) => m.id === payload.message.id);
+      if (idx < 0) return prev;
+      const copy = prev.slice();
+      copy[idx] = payload.message;
+      return copy;
     });
+  }, []);
 
-    s.on('roomUserCount', (payload: { roomId: number; count: number }) => {
+  const onRoomUserCount = useCallback(
+    (payload: { roomId: number; count: number }) => {
+      roomCountsRef.current[payload.roomId] = payload.count;
       queryClient.setQueryData<RoomWithCount[]>(['rooms'], (old) =>
         old
           ? old.map((r) =>
@@ -267,25 +287,71 @@ const ChatPage: React.FC = () => {
             )
           : old,
       );
-    });
+    },
+    [queryClient],
+  );
 
-    setSocket(s);
+  const onRoomsOnlineSnapshot = useCallback(
+    (payload: { rooms: { roomId: number; count: number }[] }) => {
+      if (!payload?.rooms?.length) return;
 
-    return () => {
-      // Marca todas as pendentes como falhas ao trocar de conexão,
-      // para evitar ficar para sempre em "Enviando..."
-      setPendingMessages((prev) =>
-        prev.map((p) => ({
-          ...p,
-          status: 'failed',
-          reason: p.reason || 'Conexão reiniciada durante o envio.',
-        })),
+      payload.rooms.forEach((r) => {
+        roomCountsRef.current[r.roomId] = r.count;
+      });
+
+      queryClient.setQueryData<RoomWithCount[]>(['rooms'], (old) =>
+        old
+          ? old.map((room) => ({
+              ...room,
+              onlineCount: roomCountsRef.current[room.id] ?? 0,
+            }))
+          : old,
       );
-      Object.values(pendingTimers.current).forEach((t) => window.clearTimeout(t));
-      pendingTimers.current = {};
-      s.disconnect();
-    };
-  }, [token, queryClient]);
+    },
+    [queryClient],
+  );
+
+  const onSessionRevoked = useCallback(
+    (payload: { message?: string }) => {
+      forceLogout(payload?.message || 'Sessão encerrada: sua conta entrou em outro dispositivo.');
+    },
+    [forceLogout],
+  );
+
+  const onSocketDisconnectedByServer = useCallback(
+    (reason: string) => {
+      if (reason !== 'io server disconnect') return;
+      forceLogout('Conexão encerrada pelo servidor. Faça login novamente.');
+    },
+    [forceLogout],
+  );
+
+  const onSocketConnectError = useCallback(
+    (message: string) => {
+      const msg = (message || '').toLowerCase();
+      const authLikeError =
+        msg.includes('unauthorized') ||
+        msg.includes('forbidden') ||
+        msg.includes('jwt') ||
+        msg.includes('token') ||
+        msg.includes('session');
+      if (!authLikeError) return;
+      forceLogout('Sua sessão foi invalidada. Faça login novamente.');
+    },
+    [forceLogout],
+  );
+
+  const onBeforeSocketDisconnect = useCallback(() => {
+    setPendingMessages((prev) =>
+      prev.map((p) => ({
+        ...p,
+        status: 'failed',
+        reason: p.reason || 'Conexão reiniciada durante o envio.',
+      })),
+    );
+    Object.values(pendingTimers.current).forEach((t) => window.clearTimeout(t));
+    pendingTimers.current = {};
+  }, []);
 
   const handleJoinRoom = (roomId: number) => {
     if (!socket) return;
@@ -385,6 +451,30 @@ const ChatPage: React.FC = () => {
     }
   };
 
+  const { socket, socketConnected } = useChatSocketConnection({
+    token,
+    socketURL,
+    onBeforeDisconnect: onBeforeSocketDisconnect,
+    onServerDisconnect: onSocketDisconnectedByServer,
+    onConnectError: onSocketConnectError,
+  });
+
+  useChatSocketEvents({
+    socket,
+    onRoomHistory,
+    onNewMessage,
+    onSendError,
+    onMessageUpdated,
+    onRoomUserCount,
+    onRoomsOnlineSnapshot,
+    onSessionRevoked,
+  });
+
+  useEffect(() => {
+    if (!socketConnected) return;
+    window.setTimeout(() => drainQueue(), 0);
+  }, [socketConnected]);
+
   const handleCreateRoom = async () => {
     const name = newRoomName.trim();
     if (!name) return;
@@ -397,15 +487,14 @@ const ChatPage: React.FC = () => {
       setNewRoomName('');
       await queryClient.invalidateQueries({ queryKey: ['rooms'] });
     } catch (err: any) {
-      alert(err.response?.data?.message || 'Erro ao criar sala');
+      showNotice(err.response?.data?.message || 'Erro ao criar sala');
     }
   };
 
   const handleSend = async () => {
     if (!socket || !currentRoomId) return;
     if (!socketConnected) {
-      setSpamNotice('Sem conexão. Aguarde reconectar para enviar.');
-      window.setTimeout(() => setSpamNotice(null), 2500);
+      showNotice('Sem conexão. Aguarde reconectar para enviar.', 2500);
       return;
     }
 
@@ -419,8 +508,7 @@ const ChatPage: React.FC = () => {
     recentSends.current = recentSends.current.filter((t) => now - t < 3000);
     recentSends.current.push(now);
     if (recentSends.current.length >= 5) {
-      setSpamNotice('Atenção: muitas mensagens em pouco tempo (possível spam).');
-      window.setTimeout(() => setSpamNotice(null), 2500);
+      showNotice('Atenção: muitas mensagens em pouco tempo (possível spam).', 2500);
     }
 
     // Se tem imagem anexada: envia UMA mensagem do tipo image (com legenda opcional).
@@ -547,7 +635,7 @@ const ChatPage: React.FC = () => {
   const saveProfileName = async () => {
     const name = profileName.trim();
     if (name.length < 2) {
-      alert('Nome deve ter pelo menos 2 caracteres');
+      showNotice('Nome deve ter pelo menos 2 caracteres', 2500);
       return;
     }
     try {
@@ -560,7 +648,7 @@ const ChatPage: React.FC = () => {
       setAuth(token, res.data);
       setProfileOpen(false);
     } catch (err: any) {
-      alert(err.response?.data?.message || 'Erro ao atualizar nome');
+      showNotice(err.response?.data?.message || 'Erro ao atualizar nome');
     } finally {
       setSavingProfile(false);
     }

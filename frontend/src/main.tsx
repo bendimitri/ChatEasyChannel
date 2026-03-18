@@ -12,6 +12,19 @@ const ChatPage = lazy(() => import('./features/chat/ChatPage'));
 
 const queryClient = new QueryClient();
 
+function SplashScreen() {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-[linear-gradient(180deg,#020617_0%,#050b16_48%,#02030a_100%)] px-4">
+      <img
+        src="/splash-screen.svg"
+        alt="Splash screen do ENTERness Chat"
+        className="w-full max-w-[420px] h-auto select-none"
+        draggable={false}
+      />
+    </div>
+  );
+}
+
 function PrivateRoute({ children }: { children: JSX.Element }) {
   const token = useAuthStore((s) => s.token);
   if (!token) {
@@ -26,7 +39,7 @@ function App() {
       <QueryClientProvider client={queryClient}>
         <AuthStoreProvider>
           <BrowserRouter>
-            <Suspense fallback={<div className="p-8">Carregando...</div>}>
+            <Suspense fallback={<SplashScreen />}>
               <Routes>
                 <Route path="/auth" element={<AuthPage />} />
                 <Route

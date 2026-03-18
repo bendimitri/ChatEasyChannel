@@ -42,6 +42,13 @@ export class RoomsService {
       throw new ForbiddenException('Você só pode criar até 3 salas');
     }
 
+    const existingActive = await this.roomsRepo.findOne({
+      where: { name, isDeleted: false },
+    });
+    if (existingActive) {
+      throw new BadRequestException('Já existe uma sala com esse nome');
+    }
+
     const room = this.roomsRepo.create({
       name,
       description: description || null,
@@ -51,9 +58,6 @@ export class RoomsService {
     try {
       return await this.roomsRepo.save(room);
     } catch (err: any) {
-      if (err?.code === 'ER_DUP_ENTRY') {
-        throw new BadRequestException('Já existe uma sala com esse nome');
-      }
       throw new BadRequestException('Erro ao criar sala');
     }
   }

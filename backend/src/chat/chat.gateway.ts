@@ -7,11 +7,28 @@ import {
   OnGatewayConnection,
   OnGatewayDisconnect,
 } from '@nestjs/websockets';
+import { ValidationPipe, UsePipes } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
 import * as jwt from 'jsonwebtoken';
 import { UsersService } from '../users/users.service';
 import { RoomsService } from '../rooms/rooms.service';
 import { MessagesService } from '../messages/messages.service';
+import { RoomActionDto } from './dtos/room-action.dto';
+import { SendMessageDto } from './dtos/send-message.dto';
+import { EditMessageDto } from './dtos/edit-message.dto';
+import { DeleteMessageDto } from './dtos/delete-message.dto';
+
+const wsPort = Number(process.env.WS_PORT || '3001');
+const corsOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173,http://localhost:4173')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const jwtSecret = process.env.JWT_SECRET || 'super_secret_jwt_key';
+const wsValidationPipe = new ValidationPipe({
+  whitelist: true,
+  forbidNonWhitelisted: true,
+  transform: true,
+});
 
 interface JwtPayload {
   sub: string;
@@ -20,9 +37,9 @@ interface JwtPayload {
   sid?: string;
 }
 
-@WebSocketGateway(3001, {
+@WebSocketGateway(wsPort, {
   cors: {
-    origin: ['http://localhost:5173', 'http://localhost:4173'],
+    origin: corsOrigins,
   },
 })
 export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
@@ -51,25 +68,37 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
         );
 
       if (!token) {
-        client.disconnect(true);
+        this.revokeAndDisconnect(client, 'Token ausente. Faça login novamente.');
         return;
       }
 
-      const secret = process.env.JWT_SECRET || 'super_secret_jwt_key';
-      const payload = jwt.verify(token, secret) as unknown as JwtPayload;
+      const payload = jwt.verify(token, jwtSecret) as unknown as JwtPayload;
       const user = await this.usersService.findById(Number(payload.sub));
       if (!user) {
-        client.disconnect(true);
+        this.revokeAndDisconnect(client, 'Usuário inválido. Faça login novamente.');
         return;
       }
       if (!payload.sid || !user.sessionId || payload.sid !== user.sessionId) {
-        client.disconnect(true);
+        this.revokeAndDisconnect(client, 'Sua conta foi aberta em outro dispositivo.');
         return;
       }
 
       (client as any).user = user;
+      client.data.userId = user.id;
+      client.data.sessionId = payload.sid;
+
+      // sessão única real: ao conectar uma nova sessão, derruba conexões antigas da mesma conta
+      this.disconnectOtherSessions(user.id, client.id);
+
+      const rooms = await this.roomsService.findAll();
+      client.emit('roomsOnlineSnapshot', {
+        rooms: rooms.map((room) => ({
+          roomId: room.id,
+          count: this.getRoomUserCount(room.id),
+        })),
+      });
     } catch (e) {
-      client.disconnect(true);
+      this.revokeAndDisconnect(client, 'Sessão inválida. Faça login novamente.');
     }
   }
 
@@ -83,11 +112,12 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('joinRoom')
+  @UsePipes(wsValidationPipe)
   async handleJoinRoom(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { roomId: number },
+    @MessageBody() data: RoomActionDto,
   ) {
-    const user = (client as any).user;
+    const user = await this.ensureClientSessionValid(client);
     if (!user) return;
 
     const room = await this.roomsService.findById(data.roomId);
@@ -113,10 +143,14 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('leaveRoom')
+  @UsePipes(wsValidationPipe)
   async handleLeaveRoom(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { roomId: number },
+    @MessageBody() data: RoomActionDto,
   ) {
+    const user = await this.ensureClientSessionValid(client);
+    if (!user) return;
+
     const prevRoomId = this.clientRooms.get(client.id);
     if (!prevRoomId) return;
     if (data.roomId !== prevRoomId) return;
@@ -127,18 +161,12 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('sendMessage')
+  @UsePipes(wsValidationPipe)
   async handleSendMessage(
     @ConnectedSocket() client: Socket,
-    @MessageBody()
-    data: {
-      roomId: number;
-      type?: 'text' | 'image';
-      content?: string;
-      imageUrl?: string;
-      clientMessageId?: string;
-    },
+    @MessageBody() data: SendMessageDto,
   ) {
-    const user = (client as any).user;
+    const user = await this.ensureClientSessionValid(client);
     if (!user) return { ok: false, message: 'Não autenticado', clientMessageId: data.clientMessageId };
 
     const now = Date.now();
@@ -206,12 +234,12 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('editMessage')
+  @UsePipes(wsValidationPipe)
   async handleEditMessage(
     @ConnectedSocket() client: Socket,
-    @MessageBody()
-    data: { roomId: number; messageId: number; content: string },
+    @MessageBody() data: EditMessageDto,
   ) {
-    const user = (client as any).user;
+    const user = await this.ensureClientSessionValid(client);
     if (!user) return;
 
     const room = await this.roomsService.findById(data.roomId);
@@ -230,12 +258,12 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('deleteMessage')
+  @UsePipes(wsValidationPipe)
   async handleDeleteMessage(
     @ConnectedSocket() client: Socket,
-    @MessageBody()
-    data: { roomId: number; messageId: number },
+    @MessageBody() data: DeleteMessageDto,
   ) {
-    const user = (client as any).user;
+    const user = await this.ensureClientSessionValid(client);
     if (!user) return;
 
     const room = await this.roomsService.findById(data.roomId);
@@ -250,14 +278,46 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   private broadcastRoomUserCount(roomId: number) {
-    const roomName = `room_${roomId}`;
-    const room = this.server.sockets.adapter.rooms.get(roomName);
-    const count = room ? room.size : 0;
-
     this.server.emit('roomUserCount', {
       roomId,
-      count,
+      count: this.getRoomUserCount(roomId),
     });
+  }
+
+  private getRoomUserCount(roomId: number) {
+    const roomName = `room_${roomId}`;
+    const room = this.server.sockets.adapter.rooms.get(roomName);
+    return room ? room.size : 0;
+  }
+
+  private disconnectOtherSessions(userId: number, currentClientId: string) {
+    for (const [socketId, socket] of this.server.sockets.sockets) {
+      if (socketId === currentClientId) continue;
+      const socketUserId = socket.data?.userId ?? (socket as any).user?.id;
+      if (socketUserId !== userId) continue;
+
+      this.revokeAndDisconnect(socket, 'Sua conta foi aberta em outro dispositivo.');
+    }
+  }
+
+  private async ensureClientSessionValid(client: Socket) {
+    const user = (client as any).user;
+    if (!user) return null;
+
+    const current = await this.usersService.findById(user.id);
+    const socketSid = client.data?.sessionId;
+    if (!current || !socketSid || !current.sessionId || current.sessionId !== socketSid) {
+      this.revokeAndDisconnect(client, 'Sua sessão foi invalidada por novo login.');
+      return null;
+    }
+
+    return user;
+  }
+
+  private revokeAndDisconnect(client: Socket, message: string) {
+    client.emit('sessionRevoked', { message });
+    // atraso ligeiramente maior para garantir entrega do evento ao cliente
+    setTimeout(() => client.disconnect(true), 250);
   }
 }
 

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ConfigModule } from '@nestjs/config';
+import { ConfigService } from '@nestjs/config';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { RoomsModule } from './rooms/rooms.module';
@@ -18,15 +19,16 @@ import { UploadsController } from './uploads/uploads.controller';
       isGlobal: true,
     }),
     TypeOrmModule.forRootAsync({
-      useFactory: () => ({
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService) => ({
         type: 'mysql',
-        host: process.env.DB_HOST || 'localhost',
-        port: Number(process.env.DB_PORT) || 3306,
-        username: process.env.DB_USER || 'root',
-        password: process.env.DB_PASS || 'root',
-        database: process.env.DB_NAME || 'chat_app',
+        host: configService.get<string>('DB_HOST', 'localhost'),
+        port: Number(configService.get<string>('DB_PORT', '3306')),
+        username: configService.get<string>('DB_USER', 'root'),
+        password: configService.get<string>('DB_PASS', 'root'),
+        database: configService.get<string>('DB_NAME', 'chat_app'),
         entities: [User, Room, Message],
-        synchronize: true, // simples para teste; em produção usar migrations
+        synchronize: false,
       }),
     }),
     UsersModule,

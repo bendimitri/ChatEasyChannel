@@ -4,9 +4,24 @@
     <meta charset="UTF-8" />
     <title>ENTERness Chat</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#020617" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="shortcut icon" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+    <link rel="manifest" href="/manifest.webmanifest" />
   </head>
   <body class="bg-slate-900 text-slate-50">
-    <div id="root"></div>
+    <div id="root">
+      <div
+        style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,#020617 0%,#050b16 48%,#02030a 100%);"
+      >
+        <img
+          src="/splash-screen.svg"
+          alt="Splash screen do ENTERness Chat"
+          style="width:min(100vw,420px);max-width:100%;height:auto;display:block;"
+        />
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
   </html>

@@ -2,6 +2,31 @@
 @tailwind components;
 @tailwind utilities;
 
+@layer base {
+  :root {
+    --background: 222 47% 11%;
+    --foreground: 210 40% 98%;
+    --card: 222 47% 14%;
+    --card-foreground: 210 40% 98%;
+    --popover: 222 47% 14%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 198 93% 60%;
+    --primary-foreground: 222 47% 11%;
+    --secondary: 217 33% 20%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217 33% 20%;
+    --muted-foreground: 215 20% 75%;
+    --accent: 217 33% 24%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 33% 25%;
+    --input: 217 33% 25%;
+    --ring: 198 93% 60%;
+    --radius: 0.75rem;
+  }
+}
+
 html,
 body,
 #root {
@@ -9,6 +34,31 @@ body,
 }
 
 body {
-  @apply bg-slate-900 text-slate-50;
+  @apply bg-background text-foreground;
+}
+
+/* Scrollbar no tema do site (Chrome/Edge/Safari + Firefox) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(198 93% 60% / 0.8) hsl(222 47% 12%);
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: hsl(222 47% 12%);
+}
+
+*::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, hsl(198 93% 60%), hsl(212 89% 56%));
+  border-radius: 9999px;
+  border: 2px solid hsl(222 47% 12%);
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, hsl(198 93% 66%), hsl(212 89% 62%));
 }
 
