@@ -18,7 +18,7 @@ Passos:
 1. No terminal, vá até a pasta raiz do projeto:
 
    ```bash
-   cd "c:\Users\dimit\Documents\DimitriProjetos\Chat React"
+   cd "c:\Users\...\Chat React"
    ```
 
 2. Construa e suba os serviços:
