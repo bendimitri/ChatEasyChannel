@@ -1,0 +1,43 @@
+services:
+  db:
+    image: mariadb:11
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: chat_app
+      MYSQL_USER: chat_user
+      MYSQL_PASSWORD: chat_pass
+    ports:
+      - "3306:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+
+  backend:
+    build: ./backend
+    command: npm run start:prod
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+    environment:
+      DB_HOST: db
+      DB_PORT: 3306
+      DB_USER: chat_user
+      DB_PASS: chat_pass
+      DB_NAME: chat_app
+      JWT_SECRET: super_secret_jwt_key
+    depends_on:
+      - db
+    volumes:
+      - backend_uploads:/app/uploads
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "4173:4173"
+    depends_on:
+      - backend
+
+volumes:
+  db_data:
+  backend_uploads:
+
