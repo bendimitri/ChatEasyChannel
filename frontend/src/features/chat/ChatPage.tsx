@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Virtuoso } from 'react-virtuoso';
+import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import { io, Socket } from 'socket.io-client';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import axios from 'axios';
@@ -10,6 +10,7 @@ interface Room {
   id: number;
   name: string;
   description?: string | null;
+  createdByUserId?: number | null;
 }
 
 interface Message {
@@ -24,6 +25,24 @@ interface Message {
   localClientMessageId?: string;
 }
 
+type PendingStatus = 'queued' | 'sending' | 'failed';
+
+type SendQueueItem =
+  | {
+      kind: 'text';
+      roomId: number;
+      clientMessageId: string;
+      content: string;
+    }
+  | {
+      kind: 'image';
+      roomId: number;
+      clientMessageId: string;
+      caption: string;
+      file: File;
+      previewUrl: string;
+    };
+
 interface RoomWithCount extends Room {
   onlineCount: number;
 }
@@ -36,6 +55,7 @@ const ChatPage: React.FC = () => {
   const token = useAuthStore((s) => s.token)!;
   const user = useAuthStore((s) => s.user)!;
   const clearAuth = useAuthStore((s) => s.clearAuth);
+  const setAuth = useAuthStore((s) => s.setAuth);
   const queryClient = useQueryClient();
 
   const [currentRoomId, setCurrentRoomId] = useState<number | null>(null);
@@ -44,8 +64,13 @@ const ChatPage: React.FC = () => {
   const [newMessage, setNewMessage] = useState('');
   const [socketConnected, setSocketConnected] = useState(false);
   const [pendingMessages, setPendingMessages] = useState<
-    { clientMessageId: string; content: string }[]
+    { clientMessageId: string; content: string; status: PendingStatus; reason?: string }[]
   >([]);
+  const pendingTimers = useRef<Record<string, number>>({});
+  const recentSends = useRef<number[]>([]);
+  const [spamNotice, setSpamNotice] = useState<string | null>(null);
+  const sendQueue = useRef<SendQueueItem[]>([]);
+  const sendingRef = useRef(false);
 
   const [socket, setSocket] = useState<Socket | null>(null);
   const [newRoomName, setNewRoomName] = useState('');
@@ -58,6 +83,22 @@ const ChatPage: React.FC = () => {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editingValue, setEditingValue] = useState('');
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [profileName, setProfileName] = useState(user.displayName || '');
+  const [savingProfile, setSavingProfile] = useState(false);
+  const virtuosoRef = useRef<VirtuosoHandle | null>(null);
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  const [confirmDelete, setConfirmDelete] = useState<{
+    open: boolean;
+    messageId: number | null;
+  }>({ open: false, messageId: null });
+
+  const [confirmDeleteRoom, setConfirmDeleteRoom] = useState<{
+    open: boolean;
+    roomId: number | null;
+    roomName: string;
+    input: string;
+  }>({ open: false, roomId: null, roomName: '', input: '' });
 
   const { data: rooms, isLoading: loadingRooms } = useQuery<RoomWithCount[]>({
     queryKey: ['rooms'],
@@ -69,6 +110,38 @@ const ChatPage: React.FC = () => {
     },
   });
 
+  const handleRequestDeleteRoom = (room: Room) => {
+    setConfirmDeleteRoom({
+      open: true,
+      roomId: room.id,
+      roomName: room.name,
+      input: '',
+    });
+  };
+
+  const handleConfirmDeleteRoom = async () => {
+    if (!confirmDeleteRoom.roomId) return;
+    if (confirmDeleteRoom.input !== confirmDeleteRoom.roomName) {
+      setSpamNotice('Digite exatamente o nome da sala para apagar.');
+      window.setTimeout(() => setSpamNotice(null), 2500);
+      return;
+    }
+    try {
+      await axios.delete(`${baseURL}/rooms/${confirmDeleteRoom.roomId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        data: { confirmName: confirmDeleteRoom.input },
+      });
+      if (currentRoomId === confirmDeleteRoom.roomId) {
+        handleLeaveRoom();
+      }
+      await queryClient.invalidateQueries({ queryKey: ['rooms'] });
+      setConfirmDeleteRoom({ open: false, roomId: null, roomName: '', input: '' });
+    } catch (err: any) {
+      setSpamNotice(err.response?.data?.message || 'Erro ao apagar sala');
+      window.setTimeout(() => setSpamNotice(null), 3000);
+    }
+  };
+
   useEffect(() => {
     const s = io(socketURL, {
       auth: { token },
@@ -76,12 +149,25 @@ const ChatPage: React.FC = () => {
       reconnectionAttempts: 5,
     });
 
-    s.on('connect', () => setSocketConnected(true));
+    s.on('connect', () => {
+      setSocketConnected(true);
+      window.setTimeout(() => drainQueue(), 0);
+    });
     s.on('disconnect', () => setSocketConnected(false));
 
     s.on('roomHistory', (payload: { roomId: number; messages: Message[] }) => {
       if (payload.roomId === currentRoomIdRef.current) {
         setMessages(payload.messages);
+        // ao entrar na sala, desce pro fim
+        requestAnimationFrame(() => {
+          if (payload.messages.length > 0) {
+            virtuosoRef.current?.scrollToIndex({
+              index: payload.messages.length - 1,
+              align: 'end',
+              behavior: 'auto',
+            });
+          }
+        });
       }
     });
 
@@ -91,6 +177,13 @@ const ChatPage: React.FC = () => {
     ) => {
       if (payload.roomId === currentRoomIdRef.current) {
         setMessages((prev) => {
+          const byId = prev.findIndex((m) => m.id === payload.message.id);
+          if (byId >= 0) {
+            const copy = prev.slice();
+            copy[byId] = payload.message;
+            return copy;
+          }
+
           if (!payload.clientMessageId) return [...prev, payload.message];
 
           const idx = prev.findIndex(
@@ -108,13 +201,52 @@ const ChatPage: React.FC = () => {
           return [...prev, payload.message];
         });
 
+        // ao receber mensagem, se estiver no fim, segue automaticamente
+        if (isAtBottom) {
+          requestAnimationFrame(() => {
+            virtuosoRef.current?.scrollToIndex({
+              index: 'LAST',
+              align: 'end',
+              behavior: 'smooth',
+            });
+          });
+        }
+
         if (payload.clientMessageId) {
           setPendingMessages((prev) =>
             prev.filter((p) => p.clientMessageId !== payload.clientMessageId),
           );
+          const t = pendingTimers.current[payload.clientMessageId];
+          if (t) {
+            window.clearTimeout(t);
+            delete pendingTimers.current[payload.clientMessageId];
+          }
         }
       }
     });
+
+    s.on(
+      'sendError',
+      (payload: { clientMessageId?: string; message: string; retryAfterMs?: number }) => {
+        if (!payload.clientMessageId) return;
+        setPendingMessages((prev) =>
+          prev.map((p) =>
+            p.clientMessageId === payload.clientMessageId
+              ? { ...p, status: 'failed', reason: payload.message }
+              : p,
+          ),
+        );
+        const t = pendingTimers.current[payload.clientMessageId];
+        if (t) {
+          window.clearTimeout(t);
+          delete pendingTimers.current[payload.clientMessageId];
+        }
+        if (payload.message) {
+          setSpamNotice(payload.message);
+          window.setTimeout(() => setSpamNotice(null), 3000);
+        }
+      },
+    );
 
     s.on('messageUpdated', (payload: { roomId: number; message: Message }) => {
       if (payload.roomId !== currentRoomIdRef.current) return;
@@ -140,6 +272,17 @@ const ChatPage: React.FC = () => {
     setSocket(s);
 
     return () => {
+      // Marca todas as pendentes como falhas ao trocar de conexão,
+      // para evitar ficar para sempre em "Enviando..."
+      setPendingMessages((prev) =>
+        prev.map((p) => ({
+          ...p,
+          status: 'failed',
+          reason: p.reason || 'Conexão reiniciada durante o envio.',
+        })),
+      );
+      Object.values(pendingTimers.current).forEach((t) => window.clearTimeout(t));
+      pendingTimers.current = {};
       s.disconnect();
     };
   }, [token, queryClient]);
@@ -153,6 +296,93 @@ const ChatPage: React.FC = () => {
     setEditingValue('');
     setMobileSidebarOpen(false);
     socket.emit('joinRoom', { roomId });
+  };
+
+  const handleLeaveRoom = () => {
+    if (!socket || !currentRoomId) return;
+    socket.emit('leaveRoom', { roomId: currentRoomId });
+    setCurrentRoomId(null);
+    currentRoomIdRef.current = null;
+    setMessages([]);
+    setEditingId(null);
+    setEditingValue('');
+    setAttachedImage(null);
+    setNewMessage('');
+    setPendingMessages([]);
+    Object.values(pendingTimers.current).forEach((t) => window.clearTimeout(t));
+    pendingTimers.current = {};
+    sendQueue.current = [];
+    sendingRef.current = false;
+  };
+
+  const setPendingStatus = (
+    clientMessageId: string,
+    status: PendingStatus,
+    reason?: string,
+  ) => {
+    setPendingMessages((prev) =>
+      prev.map((p) =>
+        p.clientMessageId === clientMessageId ? { ...p, status, reason } : p,
+      ),
+    );
+  };
+
+  const markFailed = (clientMessageId: string, reason: string) => {
+    setPendingStatus(clientMessageId, 'failed', reason);
+    const t = pendingTimers.current[clientMessageId];
+    if (t) {
+      window.clearTimeout(t);
+      delete pendingTimers.current[clientMessageId];
+    }
+  };
+
+  const drainQueue = async () => {
+    if (sendingRef.current) return;
+    if (!socket || !socketConnected) return;
+    if (!currentRoomIdRef.current) return;
+    if (sendQueue.current.length === 0) return;
+
+    sendingRef.current = true;
+    try {
+      while (sendQueue.current.length > 0 && socket && socketConnected) {
+        const item = sendQueue.current.shift()!;
+        setPendingStatus(item.clientMessageId, 'sending');
+
+        pendingTimers.current[item.clientMessageId] = window.setTimeout(() => {
+          markFailed(item.clientMessageId, 'Tempo esgotado (sem confirmação do servidor).');
+        }, 12000);
+
+        if (item.kind === 'image') {
+          try {
+            const form = new FormData();
+            form.append('file', item.file);
+            const res = await axios.post<{ url: string }>(`${baseURL}/uploads/image`, form, {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            const imageUrl = `${baseURL}${res.data.url}`;
+
+            socket.emit('sendMessage', {
+              roomId: item.roomId,
+              type: 'image',
+              imageUrl,
+              content: item.caption,
+              clientMessageId: item.clientMessageId,
+            });
+          } catch (e: any) {
+            markFailed(item.clientMessageId, e?.response?.data?.message || 'Falha no upload');
+          }
+        } else {
+          socket.emit('sendMessage', {
+            roomId: item.roomId,
+            type: 'text',
+            content: item.content,
+            clientMessageId: item.clientMessageId,
+          });
+        }
+      }
+    } finally {
+      sendingRef.current = false;
+    }
   };
 
   const handleCreateRoom = async () => {
@@ -173,11 +403,25 @@ const ChatPage: React.FC = () => {
 
   const handleSend = async () => {
     if (!socket || !currentRoomId) return;
+    if (!socketConnected) {
+      setSpamNotice('Sem conexão. Aguarde reconectar para enviar.');
+      window.setTimeout(() => setSpamNotice(null), 2500);
+      return;
+    }
 
     const content = newMessage.trim();
     const hasImage = !!attachedImage;
     const hasText = !!content;
     if (!hasImage && !hasText) return;
+
+    // aviso anti-spam no frontend (não bloqueia totalmente, só alerta)
+    const now = Date.now();
+    recentSends.current = recentSends.current.filter((t) => now - t < 3000);
+    recentSends.current.push(now);
+    if (recentSends.current.length >= 5) {
+      setSpamNotice('Atenção: muitas mensagens em pouco tempo (possível spam).');
+      window.setTimeout(() => setSpamNotice(null), 2500);
+    }
 
     // Se tem imagem anexada: envia UMA mensagem do tipo image (com legenda opcional).
     if (hasImage && attachedImage) {
@@ -199,34 +443,30 @@ const ChatPage: React.FC = () => {
       setMessages((prev) => [...prev, optimistic]);
       setPendingMessages((prev) => [
         ...prev,
-        { clientMessageId, content: '[imagem]' },
+        { clientMessageId, content: '[imagem]', status: 'queued' },
       ]);
 
       // limpa UI imediatamente
       setNewMessage('');
       setAttachedImage(null);
-
-      try {
-        const form = new FormData();
-        form.append('file', attachedImage.file);
-        const res = await axios.post<{ url: string }>(`${baseURL}/uploads/image`, form, {
-          headers: { Authorization: `Bearer ${token}` },
+      // ao enviar, desce pro fim
+      requestAnimationFrame(() => {
+        virtuosoRef.current?.scrollToIndex({
+          index: 'LAST',
+          align: 'end',
+          behavior: 'smooth',
         });
+      });
 
-        const imageUrl = `${baseURL}${res.data.url}`;
-        socket.emit('sendMessage', {
-          roomId: currentRoomId,
-          type: 'image',
-          imageUrl,
-          content, // legenda
-          clientMessageId,
-        });
-      } catch (err: any) {
-        alert(err.response?.data?.message || 'Erro ao enviar imagem');
-        setPendingMessages((prev) =>
-          prev.filter((p) => p.clientMessageId !== clientMessageId),
-        );
-      }
+      sendQueue.current.push({
+        kind: 'image',
+        roomId: currentRoomId,
+        clientMessageId,
+        caption: content,
+        file: attachedImage.file,
+        previewUrl: attachedImage.previewUrl,
+      });
+      drainQueue();
       return;
     }
 
@@ -248,15 +488,22 @@ const ChatPage: React.FC = () => {
         localClientMessageId: clientMessageId,
       };
       setMessages((prev) => [...prev, optimistic]);
-      setPendingMessages((prev) => [...prev, { clientMessageId, content }]);
+      setPendingMessages((prev) => [
+        ...prev,
+        { clientMessageId, content, status: 'queued' },
+      ]);
       setNewMessage('');
-
-      socket.emit('sendMessage', {
-        roomId: currentRoomId,
-        type: 'text',
-        content,
-        clientMessageId,
+      // ao enviar, desce pro fim
+      requestAnimationFrame(() => {
+        virtuosoRef.current?.scrollToIndex({
+          index: 'LAST',
+          align: 'end',
+          behavior: 'smooth',
+        });
       });
+
+      sendQueue.current.push({ kind: 'text', roomId: currentRoomId, clientMessageId, content });
+      drainQueue();
     }
   };
 
@@ -284,8 +531,7 @@ const ChatPage: React.FC = () => {
     if (!socket || !currentRoomId) return;
     if (m.user.id !== user.id) return;
     if (m.isDeleted) return;
-    if (!confirm('Apagar esta mensagem?')) return;
-    socket.emit('deleteMessage', { roomId: currentRoomId, messageId: m.id });
+    setConfirmDelete({ open: true, messageId: m.id });
   };
 
   const handlePickImage = () => {
@@ -298,6 +544,33 @@ const ChatPage: React.FC = () => {
     setAttachedImage({ file, previewUrl, name: file.name });
   };
 
+  const saveProfileName = async () => {
+    const name = profileName.trim();
+    if (name.length < 2) {
+      alert('Nome deve ter pelo menos 2 caracteres');
+      return;
+    }
+    try {
+      setSavingProfile(true);
+      const res = await axios.patch(
+        `${baseURL}/users/me`,
+        { displayName: name },
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      setAuth(token, res.data);
+      setProfileOpen(false);
+    } catch (err: any) {
+      alert(err.response?.data?.message || 'Erro ao atualizar nome');
+    } finally {
+      setSavingProfile(false);
+    }
+  };
+
+  const openProfile = () => {
+    setProfileName(user.displayName || '');
+    setProfileOpen(true);
+  };
+
   const connectionStatus = useMemo(() => {
     if (socketConnected) return 'Online';
     return 'Reconectando...';
@@ -305,6 +578,192 @@ const ChatPage: React.FC = () => {
 
   return (
     <div className="h-[100dvh] flex bg-slate-900 text-slate-50">
+      {spamNotice && (
+        <div className="fixed top-3 left-1/2 -translate-x-1/2 z-[80] px-4 py-2 rounded-full bg-slate-950 border border-slate-700 text-sm shadow-lg">
+          {spamNotice}
+        </div>
+      )}
+      {/* Modal de Perfil */}
+      {profileOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+          <button
+            type="button"
+            className="absolute inset-0 bg-black/60"
+            onClick={() => setProfileOpen(false)}
+            aria-label="Fechar perfil"
+          />
+          <div
+            className="relative w-full max-w-md rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Perfil e configurações"
+          >
+            <div className="p-4 border-b border-slate-800 flex items-center justify-between">
+              <div>
+                <div className="text-lg font-bold">Perfil</div>
+                <div className="text-xs text-slate-400">Atualize seu nome de usuário</div>
+              </div>
+              <button
+                type="button"
+                className="px-3 py-2 rounded-lg border border-slate-700 hover:bg-slate-800"
+                onClick={() => setProfileOpen(false)}
+                aria-label="Fechar"
+              >
+                Fechar
+              </button>
+            </div>
+            <div className="p-4 space-y-4">
+              <div className="text-xs text-slate-400">
+                Logado como <span className="text-slate-200">{user.email}</span>
+              </div>
+
+              <div className="space-y-1">
+                <label htmlFor="profileDisplayName" className="block text-sm font-medium">
+                  Nome de usuário
+                </label>
+                <input
+                  id="profileDisplayName"
+                  className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 focus:outline-none focus:ring-2 focus:ring-sky-500"
+                  value={profileName}
+                  onChange={(e) => setProfileName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') saveProfileName();
+                    if (e.key === 'Escape') setProfileOpen(false);
+                  }}
+                  disabled={savingProfile}
+                  autoFocus
+                />
+                <div className="text-xs text-slate-400">Entre 2 e 30 caracteres.</div>
+              </div>
+            </div>
+            <div className="p-4 border-t border-slate-800 flex gap-2">
+              <button
+                type="button"
+                className="flex-1 px-4 py-2 rounded-lg bg-sky-500 hover:bg-sky-600 disabled:bg-sky-700 text-white font-semibold"
+                onClick={saveProfileName}
+                disabled={savingProfile}
+                aria-label="Salvar nome"
+              >
+                {savingProfile ? 'Salvando...' : 'Salvar'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Confirmação customizada (apagar mensagem) */}
+      {confirmDelete.open && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
+          <button
+            type="button"
+            className="absolute inset-0 bg-black/60"
+            onClick={() => setConfirmDelete({ open: false, messageId: null })}
+            aria-label="Fechar confirmação"
+          />
+          <div
+            className="relative w-full max-w-sm rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Confirmar exclusão"
+          >
+            <div className="p-4 border-b border-slate-800">
+              <div className="text-lg font-bold">Apagar mensagem?</div>
+              <div className="text-sm text-slate-400 mt-1">
+                Essa ação não pode ser desfeita.
+              </div>
+            </div>
+            <div className="p-4 flex gap-2">
+              <button
+                type="button"
+                className="flex-1 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white font-semibold"
+                onClick={() => {
+                  if (socket && currentRoomId && confirmDelete.messageId) {
+                    socket.emit('deleteMessage', {
+                      roomId: currentRoomId,
+                      messageId: confirmDelete.messageId,
+                    });
+                  }
+                  setConfirmDelete({ open: false, messageId: null });
+                }}
+                aria-label="Confirmar apagar"
+              >
+                Apagar
+              </button>
+              <button
+                type="button"
+                className="px-4 py-2 rounded-lg border border-slate-700 hover:bg-slate-800"
+                onClick={() => setConfirmDelete({ open: false, messageId: null })}
+                aria-label="Fechar"
+              >
+                Fechar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Confirmação customizada (apagar sala) */}
+      {confirmDeleteRoom.open && (
+        <div className="fixed inset-0 z-[75] flex items-center justify-center p-4">
+          <button
+            type="button"
+            className="absolute inset-0 bg-black/60"
+            onClick={() =>
+              setConfirmDeleteRoom({ open: false, roomId: null, roomName: '', input: '' })
+            }
+            aria-label="Fechar confirmação"
+          />
+          <div
+            className="relative w-full max-w-sm rounded-2xl border border-slate-700 bg-slate-900 shadow-2xl"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Confirmar apagar sala"
+          >
+            <div className="p-4 border-b border-slate-800">
+              <div className="text-lg font-bold">Apagar sala?</div>
+              <div className="text-sm text-slate-400 mt-1">
+                Para confirmar, digite o nome:
+                <span className="text-slate-200 font-semibold"> {confirmDeleteRoom.roomName}</span>
+              </div>
+            </div>
+            <div className="p-4 space-y-3">
+              <label className="sr-only" htmlFor="confirmRoomName">
+                Digite o nome da sala
+              </label>
+              <input
+                id="confirmRoomName"
+                className="w-full px-3 py-2 rounded-lg bg-slate-950 border border-slate-700 focus:outline-none focus:ring-2 focus:ring-red-500"
+                value={confirmDeleteRoom.input}
+                onChange={(e) =>
+                  setConfirmDeleteRoom((s) => ({ ...s, input: e.target.value }))
+                }
+                placeholder="Nome da sala"
+                autoFocus
+              />
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  className="flex-1 px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white font-semibold disabled:opacity-50"
+                  onClick={handleConfirmDeleteRoom}
+                  disabled={confirmDeleteRoom.input !== confirmDeleteRoom.roomName}
+                >
+                  Apagar sala
+                </button>
+                <button
+                  type="button"
+                  className="px-4 py-2 rounded-lg border border-slate-700 hover:bg-slate-800"
+                  onClick={() =>
+                    setConfirmDeleteRoom({ open: false, roomId: null, roomName: '', input: '' })
+                  }
+                >
+                  Fechar
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* overlay mobile */}
       {mobileSidebarOpen && (
         <button
@@ -326,15 +785,26 @@ const ChatPage: React.FC = () => {
             <div className="text-sm font-semibold">{user.displayName}</div>
             <div className="text-xs text-slate-400">{user.email}</div>
           </div>
-          <button
-            onClick={() => {
-              clearAuth();
-              navigate('/auth');
-            }}
-            className="text-xs px-2 py-1 border border-slate-600 rounded hover:bg-slate-800"
-          >
-            Sair
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={openProfile}
+              className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold"
+              aria-label="Abrir perfil"
+              title="Perfil"
+            >
+              Perfil
+            </button>
+            <button
+              onClick={() => {
+                clearAuth();
+                navigate('/auth');
+              }}
+              className="text-xs px-3 py-2 border border-slate-600 rounded-lg hover:bg-slate-800"
+            >
+              Sair
+            </button>
+          </div>
         </div>
         <div className="px-3 py-2 border-b border-slate-800">
           <label htmlFor="newRoom" className="block text-xs text-slate-400 mb-1">
@@ -374,24 +844,38 @@ const ChatPage: React.FC = () => {
             <ul>
               {rooms?.map((room) => (
                 <li key={room.id}>
-                  <button
-                    onClick={() => handleJoinRoom(room.id)}
-                    className={`w-full text-left px-4 py-2 flex justify-between items-center hover:bg-slate-800 ${
+                  <div
+                    className={`w-full px-4 py-2 flex justify-between items-center hover:bg-slate-800 ${
                       currentRoomId === room.id ? 'bg-slate-800' : ''
                     }`}
                   >
-                    <div>
+                    <button
+                      onClick={() => handleJoinRoom(room.id)}
+                      className="flex-1 text-left"
+                      aria-label={`Entrar na sala ${room.name}`}
+                    >
                       <div className="text-sm font-medium">{room.name}</div>
                       {room.description && (
-                        <div className="text-xs text-slate-400">
-                          {room.description}
-                        </div>
+                        <div className="text-xs text-slate-400">{room.description}</div>
+                      )}
+                    </button>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs px-2 py-1 rounded-full bg-slate-700 text-slate-200">
+                        {room.onlineCount} online
+                      </span>
+                      {room.createdByUserId === user.id && (
+                        <button
+                          type="button"
+                          className="text-xs px-2 py-1 rounded-lg bg-red-500/20 hover:bg-red-500/30 border border-red-400/30 text-red-100"
+                          onClick={() => handleRequestDeleteRoom(room)}
+                          aria-label={`Apagar sala ${room.name}`}
+                          title="Apagar sala"
+                        >
+                          Apagar
+                        </button>
                       )}
                     </div>
-                    <span className="text-xs px-2 py-1 rounded-full bg-slate-700 text-slate-200">
-                      {room.onlineCount} online
-                    </span>
-                  </button>
+                  </div>
                 </li>
               ))}
             </ul>
@@ -419,16 +903,32 @@ const ChatPage: React.FC = () => {
                 : 'Escolha uma sala'}
             </h2>
           </div>
-          <div className="text-xs text-slate-400 hidden sm:block">
-            {connectionStatus}
+          <div className="flex items-center gap-2">
+            {currentRoomId && (
+              <button
+                type="button"
+                className="px-3 py-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-xs"
+                onClick={handleLeaveRoom}
+                aria-label="Sair da sala"
+                title="Sair da sala"
+              >
+                Sair da sala
+              </button>
+            )}
+            <div className="text-xs text-slate-400 hidden sm:block">
+              {connectionStatus}
+            </div>
           </div>
         </header>
 
         <section className="flex-1" aria-label="Mensagens">
           {currentRoomId ? (
             <Virtuoso
+              ref={virtuosoRef}
               style={{ height: '100%' }}
               data={messages}
+              atBottomStateChange={setIsAtBottom}
+              followOutput={(atBottom) => (atBottom ? 'smooth' : false)}
               components={{
                 List: React.forwardRef(function List(props, ref: any) {
                   return (
@@ -449,6 +949,9 @@ const ChatPage: React.FC = () => {
                       (p) => p.clientMessageId === message.localClientMessageId,
                     )
                   : false;
+                const pendingInfo = message.localClientMessageId
+                  ? pendingMessages.find((p) => p.clientMessageId === message.localClientMessageId)
+                  : undefined;
                 const align = isOwn ? 'items-end' : 'items-start';
                 return (
                   <div
@@ -470,13 +973,13 @@ const ChatPage: React.FC = () => {
                           {new Date(message.createdAt).toLocaleTimeString()}
                         </span>
                       </div>
-                      {isOwn && !pending && message.id > 0 && (
-                        <div className="flex justify-end gap-2 mb-1">
+                      {isOwn && !pending && message.id > 0 && editingId !== message.id && (
+                        <div className="flex justify-end gap-2 mb-2">
                           {!message.isDeleted && (
                             <>
                               <button
                                 type="button"
-                                className="text-[10px] underline opacity-90 hover:opacity-100"
+                                className="text-xs px-3 py-1 rounded-full bg-white/10 hover:bg-white/20 border border-white/10"
                                 onClick={() => startEdit(message)}
                                 aria-label="Editar mensagem"
                               >
@@ -484,7 +987,7 @@ const ChatPage: React.FC = () => {
                               </button>
                               <button
                                 type="button"
-                                className="text-[10px] underline opacity-90 hover:opacity-100"
+                                className="text-xs px-3 py-1 rounded-full bg-red-500/20 hover:bg-red-500/30 border border-red-400/30 text-red-100"
                                 onClick={() => deleteMsg(message)}
                                 aria-label="Apagar mensagem"
                               >
@@ -495,9 +998,9 @@ const ChatPage: React.FC = () => {
                         </div>
                       )}
                       {editingId === message.id ? (
-                        <div className="flex gap-2">
+                        <div className="flex gap-2 items-center">
                           <input
-                            className="flex-1 px-2 py-1 rounded bg-slate-900/50 border border-white/20 text-xs"
+                            className="flex-1 px-3 py-2 rounded-lg bg-slate-950 border border-white/15 text-sm focus:outline-none focus:ring-2 focus:ring-sky-500"
                             value={editingValue}
                             onChange={(e) => setEditingValue(e.target.value)}
                             onKeyDown={(e) => {
@@ -510,16 +1013,16 @@ const ChatPage: React.FC = () => {
                           <button
                             type="button"
                             onClick={confirmEdit}
-                            className="text-xs px-2 py-1 rounded bg-white/10 hover:bg-white/20"
+                            className="text-xs px-3 py-2 rounded-lg bg-sky-500 hover:bg-sky-600 text-white font-semibold"
                           >
-                            OK
+                            Salvar
                           </button>
                           <button
                             type="button"
                             onClick={cancelEdit}
-                            className="text-xs px-2 py-1 rounded bg-white/10 hover:bg-white/20"
+                            className="text-xs px-3 py-2 rounded-lg border border-slate-700 hover:bg-slate-800"
                           >
-                            X
+                            Fechar
                           </button>
                         </div>
                       ) : (
@@ -553,8 +1056,12 @@ const ChatPage: React.FC = () => {
                         </>
                       )}
                       {pending && (
-                        <div className="text-[10px] mt-1 text-slate-200 opacity-70">
-                          Enviando...
+                        <div className="text-[10px] mt-1 text-slate-200 opacity-80">
+                          {pendingInfo?.status === 'failed'
+                            ? `Falhou: ${pendingInfo.reason || 'Erro'}`
+                            : pendingInfo?.status === 'queued'
+                              ? 'Na fila...'
+                              : 'Enviando...'}
                         </div>
                       )}
                     </div>

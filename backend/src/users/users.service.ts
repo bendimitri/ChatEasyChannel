@@ -34,5 +34,12 @@ export class UsersService {
     await this.usersRepo.update({ id: userId }, { sessionId });
     return sessionId;
   }
+
+  async updateDisplayName(userId: number, displayName: string) {
+    await this.usersRepo.update({ id: userId }, { displayName });
+    const updated = await this.findById(userId);
+    if (!updated) throw new Error('Usuário não encontrado');
+    return updated;
+  }
 }
 

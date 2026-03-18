@@ -32,6 +32,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   // usuário só pode estar em uma sala por vez
   private clientRooms = new Map<string, number>();
 
+  // anti-spam simples (memória): >5 msgs em 5s bloqueia por 5s
+  private rate = new Map<number, { ts: number[]; blockedUntil: number }>();
+
   constructor(
     private readonly usersService: UsersService,
     private readonly roomsService: RoomsService,
@@ -109,6 +112,20 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.broadcastRoomUserCount(room.id);
   }
 
+  @SubscribeMessage('leaveRoom')
+  async handleLeaveRoom(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { roomId: number },
+  ) {
+    const prevRoomId = this.clientRooms.get(client.id);
+    if (!prevRoomId) return;
+    if (data.roomId !== prevRoomId) return;
+
+    client.leave(`room_${prevRoomId}`);
+    this.clientRooms.delete(client.id);
+    this.broadcastRoomUserCount(prevRoomId);
+  }
+
   @SubscribeMessage('sendMessage')
   async handleSendMessage(
     @ConnectedSocket() client: Socket,
@@ -122,27 +139,70 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     },
   ) {
     const user = (client as any).user;
-    if (!user) return;
+    if (!user) return { ok: false, message: 'Não autenticado', clientMessageId: data.clientMessageId };
+
+    const now = Date.now();
+    const entry = this.rate.get(user.id) || { ts: [], blockedUntil: 0 };
+    if (entry.blockedUntil > now) {
+      const payload = {
+        ok: false,
+        clientMessageId: data.clientMessageId,
+        message: 'Spam detectado. Aguarde alguns segundos.',
+        retryAfterMs: entry.blockedUntil - now,
+      };
+      client.emit('sendError', payload);
+      this.rate.set(user.id, entry);
+      return payload;
+    }
+    entry.ts = entry.ts.filter((t) => now - t < 5000);
+    entry.ts.push(now);
+    if (entry.ts.length > 5) {
+      entry.blockedUntil = now + 5000;
+      this.rate.set(user.id, entry);
+      const payload = {
+        ok: false,
+        clientMessageId: data.clientMessageId,
+        message: 'Muitas mensagens em pouco tempo. Aguarde 5 segundos.',
+        retryAfterMs: 5000,
+      };
+      client.emit('sendError', payload);
+      return payload;
+    }
+    this.rate.set(user.id, entry);
 
     const room = await this.roomsService.findById(data.roomId);
-    if (!room) return;
+    if (!room) {
+      return { ok: false, message: 'Sala não encontrada', clientMessageId: data.clientMessageId };
+    }
 
-    const type = data.type || 'text';
-    const message =
-      type === 'image'
-        ? await this.messagesService.createImage(
-            data.imageUrl || '',
-            data.content || '',
-            user,
-            room,
-          )
-        : await this.messagesService.createText(data.content || '', user, room);
+    try {
+      const type = data.type || 'text';
+      const message =
+        type === 'image'
+          ? await this.messagesService.createImage(
+              data.imageUrl || '',
+              data.content || '',
+              user,
+              room,
+            )
+          : await this.messagesService.createText(data.content || '', user, room);
 
-    this.server.to(`room_${room.id}`).emit('newMessage', {
-      roomId: room.id,
-      message,
-      clientMessageId: data.clientMessageId,
-    });
+      this.server.to(`room_${room.id}`).emit('newMessage', {
+        roomId: room.id,
+        message,
+        clientMessageId: data.clientMessageId,
+      });
+
+      return { ok: true, roomId: room.id, message, clientMessageId: data.clientMessageId };
+    } catch (e) {
+      const payload = {
+        ok: false,
+        clientMessageId: data.clientMessageId,
+        message: 'Falha ao enviar. Tente novamente.',
+      };
+      client.emit('sendError', payload);
+      return payload;
+    }
   }
 
   @SubscribeMessage('editMessage')
