@@ -19,6 +19,13 @@ export class Room {
   @Column({ type: 'varchar', length: 255, nullable: true })
   description: string | null;
 
+  // dono da sala (null = sala do sistema, ex.: "Geral")
+  @Column({ type: 'int', nullable: true })
+  createdByUserId: number | null;
+
+  @Column({ type: 'boolean', default: false })
+  isDeleted: boolean;
+
   @OneToMany(() => Message, (message) => message.room)
   messages: Message[];
 
