@@ -15,7 +15,7 @@ pnpm-debug.log*
 !**/.env.example
 
 # local uploads
-uploads/
+/uploads/
 
 # editor
 .vscode/
