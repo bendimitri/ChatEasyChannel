@@ -27,7 +27,14 @@ export class SendMessageDto {
 
   @ValidateIf((o) => o.type === 'image')
   @IsString()
-  @IsUrl({ require_protocol: true })
+  @Length(1, 500)
+  // require_tld: false — senão http://localhost:3000/... e IPs locais falham na validação
+  // e o gateway não emite newMessage (cliente fica em "Enviando..." até timeout).
+  @IsUrl({
+    require_protocol: true,
+    require_tld: false,
+    allow_underscores: true,
+  })
   imageUrl?: string;
 
   @IsOptional()
